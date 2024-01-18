@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -22,11 +21,11 @@ func main() {
 		DB:       0,
 	})
 
-	ticker := time.NewTicker(1 * time.Second)
+	//ticker := time.NewTicker(1 * time.Second)
 
 	go func() {
 		for {
-			<-ticker.C
+			//<-ticker.C
 			res := findMatch(redisClient)
 			if len(res) > 0 {
 				fmt.Println("Match found:", res)

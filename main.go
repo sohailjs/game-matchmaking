@@ -18,7 +18,7 @@ func main() {
 		DB:       0,
 	})
 
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 100; i++ {
 		addPlayer(redisClient, "P"+strconv.Itoa(i))
 	}
 
