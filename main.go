@@ -18,13 +18,21 @@ import (
 var ctx = context.Background()
 
 const (
-	MatchmakingPool = "matchmaking_pool"
+	MatchmakingPool  = "matchmaking_pool"
+	PlayerJoin       = "player_join"
+	WaitTimerExpired = "wait_timer_expired"
+	SessionStart     = "session_start"
 )
 
 type session struct {
 	ID      uuid.UUID `json:"id"`
 	Mode    string    `json:"mode"`
 	Players []string  `json:"players"`
+}
+
+type Event struct {
+	Type string `json:"type"`
+	Data string `json:"data"`
 }
 
 type request struct {
@@ -54,6 +62,7 @@ func init() {
 }
 
 const PlayerQueue = "queue"
+const EventQueue = "event"
 
 func handleWebSocket(c *gin.Context) {
 	userId := c.Query("userId")
@@ -80,13 +89,18 @@ func handleWebSocket(c *gin.Context) {
 		log.Println(err)
 		return
 	}
-	//accept different command from player. eg JOIN_GAME,LEAVE_GAME
-
+	//publish event to redis
+	event := Event{
+		Type: PlayerJoin,
+		Data: string(data),
+	}
+	jsonData, err := json.Marshal(event)
 	if err != nil {
-		log.Println(err)
+		log.Println("Error marshaling event data:", err)
 		return
 	}
-	rdb.LPush(ctx, PlayerQueue, data)
+
+	rdb.LPush(ctx, EventQueue, string(jsonData))
 	for {
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
@@ -109,7 +123,7 @@ func main() {
 
 	go func() {
 		for {
-			processRedisQueue()
+			processEvents()
 		}
 	}()
 
@@ -121,21 +135,38 @@ func main() {
 	}
 }
 
-func processRedisQueue() {
-	// BLPOP blocks until an item is available in the queue
-	result, err := rdb.BLPop(ctx, 0*time.Second, PlayerQueue).Result()
+func processEvents() {
+	result, err := rdb.LPop(ctx, EventQueue).Result()
 	if err != nil {
-		fmt.Println("Error processing queue:", err)
+		//fmt.Println("Error processing event queue:", err)
 		return
 	}
-	if len(result) > 1 {
-		data := result[1] // The first element is the queue name, the second is the data
-		processData(data)
+	if result != "" {
+		processEventData(result)
 	}
 }
 
-func processData(data string) {
-	log.Println("Processing data:", data)
+func processEventData(data string) {
+	log.Println("Processing event data:", data)
+	var event Event
+	err := json.Unmarshal([]byte(data), &event)
+	if err != nil {
+		return
+	}
+	switch event.Type {
+	case PlayerJoin:
+		processPlayerJoin(event.Data)
+	case WaitTimerExpired:
+		processWaitTimerExpired(event.Data)
+	}
+}
+
+func processWaitTimerExpired(data string) {
+	timerKey := data
+	log.Printf("Wait timer expired, starting session: %s", timerKey)
+}
+
+func processPlayerJoin(data string) {
 	var req request
 	err := json.Unmarshal([]byte(data), &req)
 	if err != nil {
@@ -195,8 +226,16 @@ func processTimers() {
 			log.Println("lock not acquired:", err)
 		} else {
 			log.Println("lock acquired")
-			log.Printf("wait timer expired, starting session: %s", msg.Payload)
-
+			event := Event{
+				Type: WaitTimerExpired,
+				Data: msg.Payload,
+			}
+			data, err := json.Marshal(event)
+			if err != nil {
+				log.Println("Error marshaling event data:", err)
+				continue
+			}
+			rdb.LPush(ctx, EventQueue, string(data))
 			if ok, err := mutex.Unlock(); !ok || err != nil {
 				log.Printf("could not release lock: %v", err)
 			} else {
