@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"github.com/gin-gonic/gin"
 	"github.com/go-redsync/redsync/v4"
@@ -24,17 +25,37 @@ const (
 	SessionStart     = "session_start"
 )
 
-type session struct {
+type Matchmaking struct {
+	Id                 uuid.UUID
+	playerIdToConn     map[string]*websocket.Conn
+	Sessions           []Session
+	playerIdToMMPlayer map[string]MMPlayer
+}
+
+func (mm *Matchmaking) addPlayer(player MMPlayer, conn *websocket.Conn) {
+	mm.playerIdToMMPlayer[player.UserId] = player
+	mm.playerIdToConn[player.UserId] = conn
+}
+
+func (mm *Matchmaking) addSession(session Session) {
+	mm.Sessions = append(mm.Sessions, session)
+}
+
+type MMPlayer struct {
+	UserId string `json:"userId"`
+	Mode   string `json:"mode"`
+}
+
+type Session struct {
 	ID      uuid.UUID `json:"id"`
 	Mode    string    `json:"mode"`
 	Players []string  `json:"players"`
 }
 
-type Event struct {
-	Type string `json:"type"`
-	Data string `json:"data"`
+type BroadCastPayload struct {
+	From          string  `json:"from	"`
+	SessionStatus Session `json:"sessionStatus"`
 }
-
 type request struct {
 	UserId string `json:"userId"`
 	Mode   string `json:"mode"`
@@ -50,6 +71,8 @@ var upgrader = websocket.Upgrader{
 
 var rdb *redis.Client
 var rs *redsync.Redsync
+var mutex *redsync.Mutex
+var mm *Matchmaking
 
 func init() {
 	rdb = redis.NewClient(&redis.Options{
@@ -59,9 +82,17 @@ func init() {
 	})
 	pool := goredis.NewPool(rdb)
 	rs = redsync.New(pool)
+	mutex = rs.NewMutex("lock")
+	mm = &Matchmaking{
+		Id:                 uuid.New(),
+		playerIdToConn:     map[string]*websocket.Conn{},
+		Sessions:           make([]Session, 0),
+		playerIdToMMPlayer: map[string]MMPlayer{},
+	}
 }
 
-const PlayerQueue = "queue"
+const PlayerQueue = "br:queue"
+const SessionStatusPubSub = "sessionStatus"
 const EventQueue = "event"
 
 func handleWebSocket(c *gin.Context) {
@@ -77,30 +108,31 @@ func handleWebSocket(c *gin.Context) {
 		UserId: userId,
 		Mode:   mode,
 	}
-	data, err := json.Marshal(newRequest)
+	_, err := json.Marshal(newRequest)
 
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+
+	mm.addPlayer(MMPlayer{
+		UserId: userId,
+		Mode:   mode,
+	}, conn)
+
 	defer func() {
 		conn.Close()
-		rdb.LRem(ctx, PlayerQueue, 1, data)
+		rdb.LRem(ctx, PlayerQueue, 1, userId)
 	}()
 
 	if err != nil {
 		log.Println(err)
 		return
 	}
-	//publish event to redis
-	event := Event{
-		Type: PlayerJoin,
-		Data: string(data),
-	}
-	jsonData, err := json.Marshal(event)
+	_, err = rdb.LPush(ctx, PlayerQueue, userId).Result()
 	if err != nil {
-		log.Println("Error marshaling event data:", err)
+		log.Printf("Error pushing user %s to queue: %s", userId, err)
+		conn.Close()
 		return
 	}
-
-	rdb.LPush(ctx, EventQueue, string(jsonData))
+	log.Printf("User %s added to queue", userId)
 	for {
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
@@ -111,6 +143,9 @@ func handleWebSocket(c *gin.Context) {
 }
 
 func main() {
+	port := flag.String("port", "8080", "Port to run server on")
+	flag.Parse()
+	addr := fmt.Sprintf(":%s", *port)
 
 	_, err := rdb.Ping(ctx).Result()
 	if err != nil {
@@ -122,149 +157,194 @@ func main() {
 	r.GET("/connect", handleWebSocket)
 
 	go func() {
-		for {
-			processEvents()
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			mutex.Lock()
+			mmTick()
+			mutex.Unlock()
 		}
 	}()
 
-	go processTimers()
-
-	err = r.Run(":8080")
+	go listenToBroadCastChannel()
+	err = r.Run(addr)
 	if err != nil {
 		log.Fatal(err)
 	}
 }
 
-func processEvents() {
-	result, err := rdb.LPop(ctx, EventQueue).Result()
+const (
+	MinPlayers = 2
+	MaxPlayers = 2
+	GameServer = "GameServer"
+)
+
+func createSessions() {
+	listLength, err := rdb.LLen(ctx, PlayerQueue).Result()
 	if err != nil {
-		//fmt.Println("Error processing event queue:", err)
+		fmt.Println("Error getting list length:", err)
 		return
 	}
-	if result != "" {
-		processEventData(result)
-	}
-}
-
-func processEventData(data string) {
-	log.Println("Processing event data:", data)
-	var event Event
-	err := json.Unmarshal([]byte(data), &event)
+	playerQueue, err := rdb.LRange(ctx, PlayerQueue, 0, listLength-1).Result()
 	if err != nil {
+		fmt.Println("Error getting list values:", err)
 		return
 	}
-	switch event.Type {
-	case PlayerJoin:
-		processPlayerJoin(event.Data)
-	case WaitTimerExpired:
-		processWaitTimerExpired(event.Data)
-	}
-}
-
-func processWaitTimerExpired(data string) {
-	timerKey := data
-	log.Printf("Wait timer expired, starting session: %s", timerKey)
-}
-
-func processPlayerJoin(data string) {
-	var req request
-	err := json.Unmarshal([]byte(data), &req)
-	if err != nil {
-		return
-	}
-	// find session, if not available then create one
-	allSessions := getAllSessions()
-	var availableSession *session
-	for _, s := range allSessions {
-		if s.Mode == req.Mode && len(s.Players) < 3 {
-			availableSession = &s
-			break
+	for _, player := range playerQueue {
+		sessionFound := false
+		for i := range mm.Sessions {
+			session := &mm.Sessions[i]
+			if len(session.Players) < MaxPlayers {
+				session.Players = append(session.Players, player)
+				sessionFound = true
+				break
+			}
+		}
+		if !sessionFound {
+			//create new session
+			mm.addSession(Session{
+				ID:      uuid.New(),
+				Mode:    "br",
+				Players: []string{player},
+			})
 		}
 	}
-	if availableSession == nil {
-		session := session{
-			ID:      uuid.New(),
-			Mode:    req.Mode,
-			Players: []string{req.UserId},
-		}
-		jsonData, err := json.Marshal(session)
+	//empty the queue
+	_, err = rdb.LTrim(ctx, PlayerQueue, 1, 0).Result()
+	if err != nil {
+		log.Printf("error emptying queue: %s", err)
+	}
+}
 
-		_, err = rdb.Set(ctx, "session:"+session.ID.String(), jsonData, 0).Result()
+func broadcastSessionStatusToPlayers() {
+	for _, session := range mm.Sessions {
+		for _, player := range session.Players {
+			if _, exists := mm.playerIdToConn[player]; exists {
+				conn := mm.playerIdToConn[player]
+				conn.WriteJSON(session)
+			}
+		}
+	}
+}
+
+func broadcastSessionStatusToPubsub() {
+	for _, session := range mm.Sessions {
+		payload := BroadCastPayload{
+			From:          mm.Id.String(),
+			SessionStatus: session,
+		}
+		broadcastPayload, _ := json.Marshal(payload)
+		_, err := rdb.Publish(ctx, SessionStatusPubSub, broadcastPayload).Result()
 		if err != nil {
-			log.Println("Error creating session:", err)
+			log.Printf("error publishing to pubsub: %s", err)
 		}
-		log.Printf("Adding player to new session: %s", session.ID.String())
-	} else {
-		log.Printf("Adding player %s to existing session: %s", req.UserId, availableSession.ID.String())
-		availableSession.Players = append(availableSession.Players, req.UserId)
-		jsonData, err := json.Marshal(availableSession)
+	}
+}
+
+func listenToBroadCastChannel() {
+	pubsub := rdb.Subscribe(ctx, SessionStatusPubSub)
+	for {
+		msg, ok := <-pubsub.Channel()
+		if !ok {
+			log.Printf("error getting data from channel")
+			continue
+		}
+		var payload BroadCastPayload
+		err := json.Unmarshal([]byte(msg.Payload), &payload)
 		if err != nil {
-			log.Println("Error marshaling session data:", err)
+			log.Printf("error unmarshalling json: %s", err)
 			return
 		}
-		_, err = rdb.Set(ctx, "session:"+availableSession.ID.String(), jsonData, 0).Result()
-		if err != nil {
-			log.Println("Error updating session data:", err)
-		}
-		if len(availableSession.Players) == 2 {
-			//start waiting_timer to start game when minimum players are available
-			rdb.SetNX(ctx, "wait_timer:"+availableSession.ID.String(), "1", 20*time.Second)
-		} else if len(availableSession.Players) >= 3 {
-			//start the game as max players threshold reached
-			log.Printf("max players reached, starting session: %s", availableSession.ID.String())
-			rdb.Del(ctx, "wait_timer:"+availableSession.ID.String())
-		}
-	}
-}
 
-func processTimers() {
-	pubsub := rdb.PSubscribe(ctx, "__keyevent@0__:expired")
-
-	for msg := range pubsub.Channel() {
-		mutex := rs.NewMutex("lock:timerProcess")
-		if err := mutex.Lock(); err != nil {
-			log.Println("lock not acquired:", err)
-		} else {
-			log.Println("lock acquired")
-			event := Event{
-				Type: WaitTimerExpired,
-				Data: msg.Payload,
-			}
-			data, err := json.Marshal(event)
-			if err != nil {
-				log.Println("Error marshaling event data:", err)
-				continue
-			}
-			rdb.LPush(ctx, EventQueue, string(data))
-			if ok, err := mutex.Unlock(); !ok || err != nil {
-				log.Printf("could not release lock: %v", err)
-			} else {
-				log.Printf("lock released: %v", msg.Payload)
+		//broadcast session status received from pubsub channel to players
+		if payload.From != mm.Id.String() {
+			fmt.Printf("\nreceived from pubsub: %v", payload)
+			for _, player := range payload.SessionStatus.Players {
+				if _, exists := mm.playerIdToConn[player]; exists {
+					conn := mm.playerIdToConn[player]
+					conn.WriteJSON(payload.SessionStatus)
+				}
 			}
 		}
 	}
 }
-
-func getAllSessions() []session {
-	var sessions []session
-	keys, err := rdb.Keys(ctx, "session:*").Result()
+func mmTick() {
+	//create sessions
+	createSessions()
+	//broadcast session status to players
+	broadcastSessionStatusToPlayers()
+	//broadcast session status to other MM servers
+	broadcastSessionStatusToPubsub()
+	/*// Get the length of the list
+	listLength, err := rdb.LLen(ctx, PlayerQueue).Result()
 	if err != nil {
-		log.Println("Error getting sessions:", err)
-		return sessions
+		fmt.Println("Error getting list length:", err)
+		return
 	}
-	for _, key := range keys {
-		data, err := rdb.Get(ctx, key).Result()
-		if err != nil {
-			log.Println("Error getting session data:", err)
-			continue
-		}
-		var s session
-		err = json.Unmarshal([]byte(data), &s)
-		if err != nil {
-			log.Println("Error unmarshalling session data:", err)
-			continue
-		}
-		sessions = append(sessions, s)
+
+	// Retrieve the list values
+	playerQueue, err := rdb.LRange(ctx, PlayerQueue, 0, listLength-1).Result()
+	if err != nil {
+		fmt.Println("Error getting list values:", err)
+		return
 	}
-	return sessions
+
+	servers, err := rdb.LRange(ctx, GameServer, 0, -1).Result()
+	if err != nil {
+		fmt.Println("Error getting servers:", err)
+		return
+	}
+
+	var sessionData []Session
+	var playersToRemove []string
+	var serversToRemove []string
+	for _, player := range playerQueue {
+
+		//TODO: check if any existing game server accepting the players
+		//
+		//find session
+		var sessionFound bool
+		var sessionsReadyForAllocation []Session
+		for i, _ := range sessionData {
+			s := &sessionData[i]
+			if len(s.Players) < MinPlayers {
+				s.Players = append(s.Players, player)
+				sessionFound = true
+				if len(s.Players) == MinPlayers {
+					sessionsReadyForAllocation = append(sessionsReadyForAllocation, *s)
+				}
+			}
+		}
+		if !sessionFound {
+			sessionData = append(sessionData, Session{
+				ID:      uuid.New(),
+				Mode:    "br",
+				Players: []string{player},
+			})
+		}
+
+		//for all ready sessions for allocation, find game server
+
+		i := 0
+		for _, s := range sessionsReadyForAllocation {
+			if len(servers) == 0 || i >= len(servers) {
+				fmt.Println("No servers available")
+				break
+			}
+			fmt.Printf("assigning session %s to server %s, players: %v\n", s.ID.String(), servers[i], s.Players)
+			//remove players in session from redis queue
+			playersToRemove = append(playersToRemove, s.Players...)
+			//remove allocated server
+			serversToRemove = append(serversToRemove, servers[i])
+			i++
+		}
+	}
+	//remove servers from redis
+	for _, server := range serversToRemove {
+		rdb.LRem(ctx, GameServer, 1, server)
+	}
+	// Remove players from Redis queue
+	for _, playerId := range playersToRemove {
+		rdb.LRem(ctx, PlayerQueue, 1, playerId)
+	}*/
 }
