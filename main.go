@@ -47,9 +47,9 @@ type MMPlayer struct {
 }
 
 type Session struct {
-	ID      uuid.UUID `json:"id"`
-	Mode    string    `json:"mode"`
-	Players []string  `json:"players"`
+	ID      uuid.UUID       `json:"id"`
+	Mode    string          `json:"mode"`
+	Players map[string]bool `json:"players"`
 }
 
 type BroadCastPayload struct {
@@ -92,6 +92,7 @@ func init() {
 }
 
 const PlayerQueue = "br:queue"
+const DisconnectedPlayersList = "disconnectedPlayers"
 const SessionStatusPubSub = "sessionStatus"
 const EventQueue = "event"
 
@@ -120,6 +121,8 @@ func handleWebSocket(c *gin.Context) {
 	defer func() {
 		conn.Close()
 		rdb.LRem(ctx, PlayerQueue, 1, userId)
+		delete(mm.playerIdToConn, userId)
+		rdb.LPush(ctx, DisconnectedPlayersList, userId)
 	}()
 
 	if err != nil {
@@ -156,15 +159,19 @@ func main() {
 
 	r.GET("/connect", handleWebSocket)
 
-	go func() {
-		ticker := time.NewTicker(1 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			mutex.Lock()
-			mmTick()
-			mutex.Unlock()
-		}
-	}()
+	isLeader := *port == "8081"
+	if isLeader {
+		fmt.Println("this is leader")
+		go func() {
+			ticker := time.NewTicker(1 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				mmTick()
+			}
+		}()
+	} else {
+		fmt.Println("this is follower")
+	}
 
 	go listenToBroadCastChannel()
 	err = r.Run(addr)
@@ -180,12 +187,7 @@ const (
 )
 
 func createSessions() {
-	listLength, err := rdb.LLen(ctx, PlayerQueue).Result()
-	if err != nil {
-		fmt.Println("Error getting list length:", err)
-		return
-	}
-	playerQueue, err := rdb.LRange(ctx, PlayerQueue, 0, listLength-1).Result()
+	playerQueue, err := rdb.LRange(ctx, PlayerQueue, 0, -1).Result()
 	if err != nil {
 		fmt.Println("Error getting list values:", err)
 		return
@@ -195,7 +197,7 @@ func createSessions() {
 		for i := range mm.Sessions {
 			session := &mm.Sessions[i]
 			if len(session.Players) < MaxPlayers {
-				session.Players = append(session.Players, player)
+				session.Players[player] = true
 				sessionFound = true
 				break
 			}
@@ -205,7 +207,7 @@ func createSessions() {
 			mm.addSession(Session{
 				ID:      uuid.New(),
 				Mode:    "br",
-				Players: []string{player},
+				Players: map[string]bool{player: true},
 			})
 		}
 	}
@@ -216,11 +218,44 @@ func createSessions() {
 	}
 }
 
+func removeDisconnectedPlayers() {
+	sessionsIdsToBeDeleted := make([]string, 0)
+	disconnectedPlayers, _ := rdb.LRange(ctx, DisconnectedPlayersList, 0, -1).Result()
+	for _, userId := range disconnectedPlayers {
+		delete(mm.playerIdToMMPlayer, userId)
+		//remove from sessions
+		for i := range mm.Sessions {
+			session := &mm.Sessions[i]
+			if _, exists := session.Players[userId]; exists {
+				delete(session.Players, userId)
+			}
+			//if 0 players in session then remove session as well
+			if len(session.Players) == 0 {
+				sessionsIdsToBeDeleted = append(sessionsIdsToBeDeleted, session.ID.String())
+			}
+		}
+	}
+
+	//clear the disconnected queue once processed
+	rdb.LTrim(ctx, DisconnectedPlayersList, 1, 0)
+
+	for _, sessionId := range sessionsIdsToBeDeleted {
+		for i := range mm.Sessions {
+			session := &mm.Sessions[i]
+			if session.ID.String() == sessionId {
+				mm.Sessions = append(mm.Sessions[:i], mm.Sessions[i+1:]...)
+				break
+			}
+		}
+	}
+
+}
+
 func broadcastSessionStatusToPlayers() {
 	for _, session := range mm.Sessions {
-		for _, player := range session.Players {
-			if _, exists := mm.playerIdToConn[player]; exists {
-				conn := mm.playerIdToConn[player]
+		for userId, _ := range session.Players {
+			if _, exists := mm.playerIdToConn[userId]; exists {
+				conn := mm.playerIdToConn[userId]
 				conn.WriteJSON(session)
 			}
 		}
@@ -259,16 +294,18 @@ func listenToBroadCastChannel() {
 		//broadcast session status received from pubsub channel to players
 		if payload.From != mm.Id.String() {
 			fmt.Printf("\nreceived from pubsub: %v", payload)
-			for _, player := range payload.SessionStatus.Players {
-				if _, exists := mm.playerIdToConn[player]; exists {
-					conn := mm.playerIdToConn[player]
+			for userId, _ := range payload.SessionStatus.Players {
+				if _, exists := mm.playerIdToConn[userId]; exists {
+					conn := mm.playerIdToConn[userId]
 					conn.WriteJSON(payload.SessionStatus)
 				}
 			}
 		}
 	}
 }
+
 func mmTick() {
+	removeDisconnectedPlayers()
 	//create sessions
 	createSessions()
 	//broadcast session status to players
