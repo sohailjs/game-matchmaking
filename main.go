@@ -23,6 +23,9 @@ const (
 	PlayerJoin       = "player_join"
 	WaitTimerExpired = "wait_timer_expired"
 	SessionStart     = "session_start"
+	leaderKey        = "leader-lock"
+	lockExpiration   = 10 * time.Second // Lock expiration time
+	heartbeatPeriod  = 5 * time.Second  // Heartbeat interval
 )
 
 type Matchmaking struct {
@@ -158,20 +161,17 @@ func main() {
 	r := gin.Default()
 
 	r.GET("/connect", handleWebSocket)
+	go leaderCheckLoop()
 
-	isLeader := *port == "8081"
-	if isLeader {
-		fmt.Println("this is leader")
-		go func() {
-			ticker := time.NewTicker(1 * time.Second)
-			defer ticker.Stop()
-			for range ticker.C {
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			if isLeader(mm.Id.String()) {
 				mmTick()
 			}
-		}()
-	} else {
-		fmt.Println("this is follower")
-	}
+		}
+	}()
 
 	go listenToBroadCastChannel()
 	err = r.Run(addr)
@@ -248,7 +248,6 @@ func removeDisconnectedPlayers() {
 			}
 		}
 	}
-
 }
 
 func broadcastSessionStatusToPlayers() {
@@ -304,6 +303,50 @@ func listenToBroadCastChannel() {
 	}
 }
 
+func tryToBecomeLeader(instanceID string) bool {
+	success, err := rdb.SetNX(ctx, leaderKey, instanceID, lockExpiration).Result()
+	if err != nil {
+		fmt.Println("Error trying to acquire leader lock:", err)
+		return false
+	}
+	return success
+}
+
+func isLeader(instanceID string) bool {
+	currentLeader, err := rdb.Get(ctx, leaderKey).Result()
+	if err == redis.Nil {
+		return false // No leader exists
+	} else if err != nil {
+		fmt.Println("Error checking leader status:", err)
+		return false
+	}
+	return currentLeader == instanceID
+}
+
+func renewLeaderLock(instanceID string) {
+	val, err := rdb.Get(ctx, leaderKey).Result()
+	if err == nil && val == instanceID {
+		rdb.Expire(ctx, leaderKey, lockExpiration)
+	}
+}
+
+func leaderCheckLoop() {
+	ticker := time.NewTicker(heartbeatPeriod)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		if tryToBecomeLeader(mm.Id.String()) {
+			fmt.Println("I am the leader!")
+			// Perform leader-specific tasks here
+		} else if isLeader(mm.Id.String()) {
+			//fmt.Println("Still the leader, renewing lock...")
+			renewLeaderLock(mm.Id.String())
+		} else {
+			//fmt.Println("Not the leader, waiting for the next attempt...")
+		}
+	}
+}
+
 func mmTick() {
 	removeDisconnectedPlayers()
 	//create sessions
@@ -312,76 +355,4 @@ func mmTick() {
 	broadcastSessionStatusToPlayers()
 	//broadcast session status to other MM servers
 	broadcastSessionStatusToPubsub()
-	/*// Get the length of the list
-	listLength, err := rdb.LLen(ctx, PlayerQueue).Result()
-	if err != nil {
-		fmt.Println("Error getting list length:", err)
-		return
-	}
-
-	// Retrieve the list values
-	playerQueue, err := rdb.LRange(ctx, PlayerQueue, 0, listLength-1).Result()
-	if err != nil {
-		fmt.Println("Error getting list values:", err)
-		return
-	}
-
-	servers, err := rdb.LRange(ctx, GameServer, 0, -1).Result()
-	if err != nil {
-		fmt.Println("Error getting servers:", err)
-		return
-	}
-
-	var sessionData []Session
-	var playersToRemove []string
-	var serversToRemove []string
-	for _, player := range playerQueue {
-
-		//TODO: check if any existing game server accepting the players
-		//
-		//find session
-		var sessionFound bool
-		var sessionsReadyForAllocation []Session
-		for i, _ := range sessionData {
-			s := &sessionData[i]
-			if len(s.Players) < MinPlayers {
-				s.Players = append(s.Players, player)
-				sessionFound = true
-				if len(s.Players) == MinPlayers {
-					sessionsReadyForAllocation = append(sessionsReadyForAllocation, *s)
-				}
-			}
-		}
-		if !sessionFound {
-			sessionData = append(sessionData, Session{
-				ID:      uuid.New(),
-				Mode:    "br",
-				Players: []string{player},
-			})
-		}
-
-		//for all ready sessions for allocation, find game server
-
-		i := 0
-		for _, s := range sessionsReadyForAllocation {
-			if len(servers) == 0 || i >= len(servers) {
-				fmt.Println("No servers available")
-				break
-			}
-			fmt.Printf("assigning session %s to server %s, players: %v\n", s.ID.String(), servers[i], s.Players)
-			//remove players in session from redis queue
-			playersToRemove = append(playersToRemove, s.Players...)
-			//remove allocated server
-			serversToRemove = append(serversToRemove, servers[i])
-			i++
-		}
-	}
-	//remove servers from redis
-	for _, server := range serversToRemove {
-		rdb.LRem(ctx, GameServer, 1, server)
-	}
-	// Remove players from Redis queue
-	for _, playerId := range playersToRemove {
-		rdb.LRem(ctx, PlayerQueue, 1, playerId)
-	}*/
 }
