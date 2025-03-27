@@ -6,8 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"github.com/gin-gonic/gin"
-	"github.com/go-redsync/redsync/v4"
-	"github.com/go-redsync/redsync/v4/redis/goredis/v9"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/redis/go-redis/v9"
@@ -73,8 +71,6 @@ var upgrader = websocket.Upgrader{
 }
 
 var rdb *redis.Client
-var rs *redsync.Redsync
-var mutex *redsync.Mutex
 var mm *Matchmaking
 
 func init() {
@@ -83,9 +79,6 @@ func init() {
 		Password: "",
 		DB:       0,
 	})
-	pool := goredis.NewPool(rdb)
-	rs = redsync.New(pool)
-	mutex = rs.NewMutex("lock")
 	mm = &Matchmaking{
 		Id:                 uuid.New(),
 		playerIdToConn:     map[string]*websocket.Conn{},
@@ -355,4 +348,5 @@ func mmTick() {
 	broadcastSessionStatusToPlayers()
 	//broadcast session status to other MM servers
 	broadcastSessionStatusToPubsub()
+
 }
