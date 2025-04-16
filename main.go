@@ -11,6 +11,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -27,14 +28,18 @@ const (
 )
 
 type Matchmaking struct {
-	Id                 uuid.UUID
-	playerIdToConn     map[string]*websocket.Conn
-	Sessions           []Session
-	playerIdToMMPlayer map[string]MMPlayer
+	Id             uuid.UUID
+	playerIdToConn map[string]*websocket.Conn
+	Sessions       []Session
+	//playerIdToMMPlayer      map[string]MMPlayer
+	mu                      sync.RWMutex
+	disconnectedPlayersChan chan string
 }
 
 func (mm *Matchmaking) addPlayer(player MMPlayer, conn *websocket.Conn) {
-	mm.playerIdToMMPlayer[player.UserId] = player
+	mm.mu.Lock()
+	defer mm.mu.Unlock()
+	//mm.playerIdToMMPlayer[player.UserId] = player
 	mm.playerIdToConn[player.UserId] = conn
 }
 
@@ -80,10 +85,11 @@ func init() {
 		DB:       0,
 	})
 	mm = &Matchmaking{
-		Id:                 uuid.New(),
-		playerIdToConn:     map[string]*websocket.Conn{},
-		Sessions:           make([]Session, 0),
-		playerIdToMMPlayer: map[string]MMPlayer{},
+		Id:             uuid.New(),
+		playerIdToConn: map[string]*websocket.Conn{},
+		Sessions:       make([]Session, 0),
+		//playerIdToMMPlayer:      map[string]MMPlayer{},
+		disconnectedPlayersChan: make(chan string),
 	}
 }
 
@@ -106,8 +112,17 @@ func handleWebSocket(c *gin.Context) {
 		Mode:   mode,
 	}
 	_, err := json.Marshal(newRequest)
+	if err != nil {
+		log.Println("Error marshalling request:", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"err": "internal server error"})
+		return
+	}
 
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		log.Println("Error upgrading connection:", err)
+		return
+	}
 
 	mm.addPlayer(MMPlayer{
 		UserId: userId,
@@ -116,9 +131,7 @@ func handleWebSocket(c *gin.Context) {
 
 	defer func() {
 		conn.Close()
-		rdb.LRem(ctx, PlayerQueue, 1, userId)
-		delete(mm.playerIdToConn, userId)
-		rdb.LPush(ctx, DisconnectedPlayersList, userId)
+		mm.disconnectedPlayersChan <- userId
 	}()
 
 	if err != nil {
@@ -160,6 +173,7 @@ func main() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
+			fmt.Printf("total connections: %d\n", len(mm.playerIdToConn))
 			if isLeader(mm.Id.String()) {
 				mmTick()
 			}
@@ -167,6 +181,7 @@ func main() {
 	}()
 
 	go listenToBroadCastChannel()
+	go processDisconnectedPlayers()
 	err = r.Run(addr)
 	if err != nil {
 		log.Fatal(err)
@@ -211,12 +226,10 @@ func createSessions() {
 	}
 }
 
-func removeDisconnectedPlayers() {
+func removeDisconnectedPlayersFromSessions() {
 	sessionsIdsToBeDeleted := make([]string, 0)
 	disconnectedPlayers, _ := rdb.LRange(ctx, DisconnectedPlayersList, 0, -1).Result()
 	for _, userId := range disconnectedPlayers {
-		delete(mm.playerIdToMMPlayer, userId)
-		//remove from sessions
 		for i := range mm.Sessions {
 			session := &mm.Sessions[i]
 			if _, exists := session.Players[userId]; exists {
@@ -233,9 +246,8 @@ func removeDisconnectedPlayers() {
 	rdb.LTrim(ctx, DisconnectedPlayersList, 1, 0)
 
 	for _, sessionId := range sessionsIdsToBeDeleted {
-		for i := range mm.Sessions {
-			session := &mm.Sessions[i]
-			if session.ID.String() == sessionId {
+		for i := len(mm.Sessions) - 1; i >= 0; i-- {
+			if mm.Sessions[i].ID.String() == sessionId {
 				mm.Sessions = append(mm.Sessions[:i], mm.Sessions[i+1:]...)
 				break
 			}
@@ -246,10 +258,12 @@ func removeDisconnectedPlayers() {
 func broadcastSessionStatusToPlayers() {
 	for _, session := range mm.Sessions {
 		for userId, _ := range session.Players {
+			mm.mu.RLock()
 			if _, exists := mm.playerIdToConn[userId]; exists {
 				conn := mm.playerIdToConn[userId]
 				conn.WriteJSON(session)
 			}
+			mm.mu.RUnlock()
 		}
 	}
 }
@@ -265,6 +279,16 @@ func broadcastSessionStatusToPubsub() {
 		if err != nil {
 			log.Printf("error publishing to pubsub: %s", err)
 		}
+	}
+}
+
+func processDisconnectedPlayers() {
+	for userId := range mm.disconnectedPlayersChan {
+		mm.mu.Lock()
+		delete(mm.playerIdToConn, userId)
+		//delete(mm.playerIdToMMPlayer, userId)
+		mm.mu.Unlock()
+		rdb.LPush(ctx, DisconnectedPlayersList, userId)
 	}
 }
 
@@ -287,10 +311,12 @@ func listenToBroadCastChannel() {
 		if payload.From != mm.Id.String() {
 			fmt.Printf("\nreceived from pubsub: %v", payload)
 			for userId, _ := range payload.SessionStatus.Players {
+				mm.mu.RLock()
 				if _, exists := mm.playerIdToConn[userId]; exists {
 					conn := mm.playerIdToConn[userId]
 					conn.WriteJSON(payload.SessionStatus)
 				}
+				mm.mu.RUnlock()
 			}
 		}
 	}
@@ -341,7 +367,7 @@ func leaderCheckLoop() {
 }
 
 func mmTick() {
-	removeDisconnectedPlayers()
+	removeDisconnectedPlayersFromSessions()
 	//create sessions
 	createSessions()
 	//broadcast session status to players
