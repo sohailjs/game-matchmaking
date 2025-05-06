@@ -201,6 +201,10 @@ func createSessions() {
 		return
 	}
 	for _, player := range playerQueue {
+		// check if player is disconnected before adding to session
+		if _, exists := mm.playerIdToConn[player]; !exists {
+			continue
+		}
 		sessionFound := false
 		for i := range mm.Sessions {
 			session := &mm.Sessions[i]
@@ -243,7 +247,7 @@ func removeDisconnectedPlayersFromSessions() {
 	}
 
 	//clear the disconnected queue once processed
-	rdb.LTrim(ctx, DisconnectedPlayersList, 1, 0)
+	rdb.Del(ctx, DisconnectedPlayersList)
 
 	for _, sessionId := range sessionsIdsToBeDeleted {
 		for i := len(mm.Sessions) - 1; i >= 0; i-- {
