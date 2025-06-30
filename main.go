@@ -6,6 +6,8 @@ import (
 	"flag"
 	"fmt"
 	"github.com/gin-gonic/gin"
+	"github.com/go-redsync/redsync/v4"
+	"github.com/go-redsync/redsync/v4/redis/goredis/v9"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/redis/go-redis/v9"
@@ -22,29 +24,122 @@ const (
 	PlayerJoin       = "player_join"
 	WaitTimerExpired = "wait_timer_expired"
 	SessionStart     = "session_start"
-	leaderKey        = "leader-lock"
-	lockExpiration   = 10 * time.Second // Lock expiration time
-	heartbeatPeriod  = 5 * time.Second  // Heartbeat interval
+
+	// Redsync constants
+	LeaderLockKey   = "matchmaking:leader"
+	LockTTL         = 30 * time.Second // Lock expiration time
+	LockRetryDelay  = 1 * time.Second  // Retry delay for acquiring lock
+	LockRetryTimes  = 3                // Number of retry attempts
+	HeartbeatPeriod = 10 * time.Second // How often to renew the lock
 )
 
 type Matchmaking struct {
-	Id             uuid.UUID
-	playerIdToConn map[string]*websocket.Conn
-	Sessions       []Session
-	//playerIdToMMPlayer      map[string]MMPlayer
+	Id                      uuid.UUID
+	playerIdToConn          map[string]*websocket.Conn
+	Sessions                []Session
 	mu                      sync.RWMutex
 	disconnectedPlayersChan chan string
+
+	// Redsync components
+	redsync      *redsync.Redsync
+	leaderLock   *redsync.Mutex
+	isLeaderFlag bool
+	leaderMu     sync.RWMutex
 }
 
 func (mm *Matchmaking) addPlayer(player MMPlayer, conn *websocket.Conn) {
 	mm.mu.Lock()
 	defer mm.mu.Unlock()
-	//mm.playerIdToMMPlayer[player.UserId] = player
 	mm.playerIdToConn[player.UserId] = conn
 }
 
 func (mm *Matchmaking) addSession(session Session) {
+	mm.mu.Lock()
+	defer mm.mu.Unlock()
 	mm.Sessions = append(mm.Sessions, session)
+}
+
+func (mm *Matchmaking) isLeader() bool {
+	mm.leaderMu.RLock()
+	defer mm.leaderMu.RUnlock()
+	return mm.isLeaderFlag
+}
+
+func (mm *Matchmaking) setLeaderStatus(isLeader bool) {
+	mm.leaderMu.Lock()
+	defer mm.leaderMu.Unlock()
+	mm.isLeaderFlag = isLeader
+}
+
+// Try to acquire leadership with Redsync
+func (mm *Matchmaking) tryBecomeLeader() bool {
+	// Create a new mutex for leader election
+	mutex := mm.redsync.NewMutex(LeaderLockKey,
+		redsync.WithExpiry(LockTTL),
+		redsync.WithTries(LockRetryTimes),
+		redsync.WithRetryDelay(LockRetryDelay),
+		redsync.WithValue(mm.Id.String()), // Use instance ID as lock value
+	)
+
+	err := mutex.Lock()
+	if err != nil {
+		mm.setLeaderStatus(false)
+		return false
+	}
+
+	// Successfully acquired the lock
+	mm.leaderLock = mutex
+	mm.setLeaderStatus(true)
+	log.Printf("Node %s became the leader", mm.Id.String())
+	return true
+}
+
+// Renew leadership lock
+func (mm *Matchmaking) renewLeadership() bool {
+	if mm.leaderLock == nil {
+		return false
+	}
+
+	// Extend the lock
+	ok, err := mm.leaderLock.Extend()
+	if err != nil || !ok {
+		log.Printf("Failed to renew leadership: %v", err)
+		mm.releaseLeadership()
+		return false
+	}
+
+	return true
+}
+
+// Release leadership
+func (mm *Matchmaking) releaseLeadership() {
+	if mm.leaderLock != nil {
+		ok, err := mm.leaderLock.Unlock()
+		if err != nil || !ok {
+			log.Printf("Error releasing leadership lock: %v", err)
+		}
+		mm.leaderLock = nil
+	}
+	mm.setLeaderStatus(false)
+	log.Printf("Node %s released leadership", mm.Id.String())
+}
+
+// Background leadership management
+func (mm *Matchmaking) leadershipLoop() {
+	ticker := time.NewTicker(HeartbeatPeriod)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		if mm.isLeader() {
+			// Try to renew existing leadership
+			if !mm.renewLeadership() {
+				log.Println("Lost leadership, will try to reacquire")
+			}
+		} else {
+			// Try to become leader
+			mm.tryBecomeLeader()
+		}
+	}
 }
 
 type MMPlayer struct {
@@ -59,9 +154,10 @@ type Session struct {
 }
 
 type BroadCastPayload struct {
-	From          string  `json:"from	"`
+	From          string  `json:"from"`
 	SessionStatus Session `json:"sessionStatus"`
 }
+
 type request struct {
 	UserId string `json:"userId"`
 	Mode   string `json:"mode"`
@@ -84,12 +180,18 @@ func init() {
 		Password: "",
 		DB:       0,
 	})
+
+	// Initialize Redsync
+	pool := goredis.NewPool(rdb)
+	rs := redsync.New(pool)
+
 	mm = &Matchmaking{
-		Id:             uuid.New(),
-		playerIdToConn: map[string]*websocket.Conn{},
-		Sessions:       make([]Session, 0),
-		//playerIdToMMPlayer:      map[string]MMPlayer{},
+		Id:                      uuid.New(),
+		playerIdToConn:          map[string]*websocket.Conn{},
+		Sessions:                make([]Session, 0),
 		disconnectedPlayersChan: make(chan string),
+		redsync:                 rs,
+		isLeaderFlag:            false,
 	}
 }
 
@@ -107,6 +209,7 @@ func handleWebSocket(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"err": "userId not provided"})
 		return
 	}
+
 	newRequest := request{
 		UserId: userId,
 		Mode:   mode,
@@ -134,10 +237,6 @@ func handleWebSocket(c *gin.Context) {
 		mm.disconnectedPlayersChan <- userId
 	}()
 
-	if err != nil {
-		log.Println(err)
-		return
-	}
 	_, err = rdb.LPush(ctx, PlayerQueue, userId).Result()
 	if err != nil {
 		log.Printf("Error pushing user %s to queue: %s", userId, err)
@@ -145,6 +244,7 @@ func handleWebSocket(c *gin.Context) {
 		return
 	}
 	log.Printf("User %s added to queue", userId)
+
 	for {
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
@@ -167,14 +267,29 @@ func main() {
 	r := gin.Default()
 
 	r.GET("/connect", handleWebSocket)
-	go leaderCheckLoop()
 
+	// Add status endpoint
+	r.GET("/status", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"nodeId":   mm.Id.String(),
+			"isLeader": mm.isLeader(),
+			"sessions": len(mm.Sessions),
+			"players":  len(mm.playerIdToConn),
+		})
+	})
+
+	// Start leadership management loop
+	go mm.leadershipLoop()
+
+	// Main game loop - only leader processes
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			fmt.Printf("total connections: %d\n", len(mm.playerIdToConn))
-			if isLeader(mm.Id.String()) {
+			fmt.Printf("Node %s - total connections: %d, isLeader: %t\n",
+				mm.Id.String(), len(mm.playerIdToConn), mm.isLeader())
+
+			if mm.isLeader() {
 				mmTick()
 			}
 		}
@@ -182,6 +297,13 @@ func main() {
 
 	go listenToBroadCastChannel()
 	go processDisconnectedPlayers()
+
+	// Graceful shutdown
+	defer func() {
+		mm.releaseLeadership()
+	}()
+
+	log.Printf("Starting matchmaking server on %s", addr)
 	err = r.Run(addr)
 	if err != nil {
 		log.Fatal(err)
@@ -200,12 +322,15 @@ func createSessions() {
 		fmt.Println("Error getting list values:", err)
 		return
 	}
+
 	for _, player := range playerQueue {
 		// check if player is disconnected before adding to session
 		if _, exists := mm.playerIdToConn[player]; !exists {
 			continue
 		}
+
 		sessionFound := false
+		mm.mu.Lock()
 		for i := range mm.Sessions {
 			session := &mm.Sessions[i]
 			if len(session.Players) < MaxPlayers {
@@ -214,6 +339,7 @@ func createSessions() {
 				break
 			}
 		}
+
 		if !sessionFound {
 			//create new session
 			mm.addSession(Session{
@@ -222,7 +348,9 @@ func createSessions() {
 				Players: map[string]bool{player: true},
 			})
 		}
+		mm.mu.Unlock()
 	}
+
 	//empty the queue
 	_, err = rdb.LTrim(ctx, PlayerQueue, 1, 0).Result()
 	if err != nil {
@@ -233,6 +361,10 @@ func createSessions() {
 func removeDisconnectedPlayersFromSessions() {
 	sessionsIdsToBeDeleted := make([]string, 0)
 	disconnectedPlayers, _ := rdb.LRange(ctx, DisconnectedPlayersList, 0, -1).Result()
+
+	mm.mu.Lock()
+	defer mm.mu.Unlock()
+
 	for _, userId := range disconnectedPlayers {
 		for i := range mm.Sessions {
 			session := &mm.Sessions[i]
@@ -249,6 +381,7 @@ func removeDisconnectedPlayersFromSessions() {
 	//clear the disconnected queue once processed
 	rdb.Del(ctx, DisconnectedPlayersList)
 
+	// Remove empty sessions
 	for _, sessionId := range sessionsIdsToBeDeleted {
 		for i := len(mm.Sessions) - 1; i >= 0; i-- {
 			if mm.Sessions[i].ID.String() == sessionId {
@@ -260,11 +393,15 @@ func removeDisconnectedPlayersFromSessions() {
 }
 
 func broadcastSessionStatusToPlayers() {
-	for _, session := range mm.Sessions {
-		for userId, _ := range session.Players {
+	mm.mu.RLock()
+	sessions := make([]Session, len(mm.Sessions))
+	copy(sessions, mm.Sessions)
+	mm.mu.RUnlock()
+
+	for _, session := range sessions {
+		for userId := range session.Players {
 			mm.mu.RLock()
-			if _, exists := mm.playerIdToConn[userId]; exists {
-				conn := mm.playerIdToConn[userId]
+			if conn, exists := mm.playerIdToConn[userId]; exists {
 				conn.WriteJSON(session)
 			}
 			mm.mu.RUnlock()
@@ -273,7 +410,12 @@ func broadcastSessionStatusToPlayers() {
 }
 
 func broadcastSessionStatusToPubsub() {
-	for _, session := range mm.Sessions {
+	mm.mu.RLock()
+	sessions := make([]Session, len(mm.Sessions))
+	copy(sessions, mm.Sessions)
+	mm.mu.RUnlock()
+
+	for _, session := range sessions {
 		payload := BroadCastPayload{
 			From:          mm.Id.String(),
 			SessionStatus: session,
@@ -290,7 +432,6 @@ func processDisconnectedPlayers() {
 	for userId := range mm.disconnectedPlayersChan {
 		mm.mu.Lock()
 		delete(mm.playerIdToConn, userId)
-		//delete(mm.playerIdToMMPlayer, userId)
 		mm.mu.Unlock()
 		rdb.LPush(ctx, DisconnectedPlayersList, userId)
 	}
@@ -298,26 +439,28 @@ func processDisconnectedPlayers() {
 
 func listenToBroadCastChannel() {
 	pubsub := rdb.Subscribe(ctx, SessionStatusPubSub)
+	defer pubsub.Close()
+
 	for {
 		msg, ok := <-pubsub.Channel()
 		if !ok {
 			log.Printf("error getting data from channel")
 			continue
 		}
+
 		var payload BroadCastPayload
 		err := json.Unmarshal([]byte(msg.Payload), &payload)
 		if err != nil {
 			log.Printf("error unmarshalling json: %s", err)
-			return
+			continue
 		}
 
 		//broadcast session status received from pubsub channel to players
 		if payload.From != mm.Id.String() {
 			fmt.Printf("\nreceived from pubsub: %v", payload)
-			for userId, _ := range payload.SessionStatus.Players {
+			for userId := range payload.SessionStatus.Players {
 				mm.mu.RLock()
-				if _, exists := mm.playerIdToConn[userId]; exists {
-					conn := mm.playerIdToConn[userId]
+				if conn, exists := mm.playerIdToConn[userId]; exists {
 					conn.WriteJSON(payload.SessionStatus)
 				}
 				mm.mu.RUnlock()
@@ -326,57 +469,27 @@ func listenToBroadCastChannel() {
 	}
 }
 
-func tryToBecomeLeader(instanceID string) bool {
-	success, err := rdb.SetNX(ctx, leaderKey, instanceID, lockExpiration).Result()
-	if err != nil {
-		fmt.Println("Error trying to acquire leader lock:", err)
-		return false
-	}
-	return success
-}
-
-func isLeader(instanceID string) bool {
-	currentLeader, err := rdb.Get(ctx, leaderKey).Result()
-	if err == redis.Nil {
-		return false // No leader exists
-	} else if err != nil {
-		fmt.Println("Error checking leader status:", err)
-		return false
-	}
-	return currentLeader == instanceID
-}
-
-func renewLeaderLock(instanceID string) {
-	val, err := rdb.Get(ctx, leaderKey).Result()
-	if err == nil && val == instanceID {
-		rdb.Expire(ctx, leaderKey, lockExpiration)
-	}
-}
-
-func leaderCheckLoop() {
-	ticker := time.NewTicker(heartbeatPeriod)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		if tryToBecomeLeader(mm.Id.String()) {
-			fmt.Println("I am the leader!")
-			// Perform leader-specific tasks here
-		} else if isLeader(mm.Id.String()) {
-			//fmt.Println("Still the leader, renewing lock...")
-			renewLeaderLock(mm.Id.String())
-		} else {
-			//fmt.Println("Not the leader, waiting for the next attempt...")
-		}
-	}
-}
-
 func mmTick() {
-	removeDisconnectedPlayersFromSessions()
-	//create sessions
-	createSessions()
-	//broadcast session status to players
-	broadcastSessionStatusToPlayers()
-	//broadcast session status to other MM servers
-	broadcastSessionStatusToPubsub()
+	// Double-check leadership before processing (extra safety)
+	if !mm.isLeader() {
+		return
+	}
 
+	removeDisconnectedPlayersFromSessions()
+
+	// Check leadership again after potentially long operation
+	if !mm.isLeader() {
+		log.Println("Lost leadership during tick, aborting remaining operations")
+		return
+	}
+
+	createSessions()
+
+	if !mm.isLeader() {
+		log.Println("Lost leadership during tick, aborting remaining operations")
+		return
+	}
+
+	broadcastSessionStatusToPlayers()
+	broadcastSessionStatusToPubsub()
 }
