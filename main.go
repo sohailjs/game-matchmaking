@@ -151,6 +151,7 @@ type Session struct {
 	ID      uuid.UUID       `json:"id"`
 	Mode    string          `json:"mode"`
 	Players map[string]bool `json:"players"`
+	RoomId  string          `json:"roomId"` // Optional field for room ID
 }
 
 type BroadCastPayload struct {
@@ -286,7 +287,7 @@ func main() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			fmt.Printf("Node %s - total connections: %d, isLeader: %t\n",
+			log.Printf("\nNode %s - total connections: %d, isLeader: %t\n",
 				mm.Id.String(), len(mm.playerIdToConn), mm.isLeader())
 
 			if mm.isLeader() {
@@ -324,11 +325,6 @@ func createSessions() {
 	}
 
 	for _, player := range playerQueue {
-		// check if player is disconnected before adding to session
-		if _, exists := mm.playerIdToConn[player]; !exists {
-			continue
-		}
-
 		sessionFound := false
 		mm.mu.Lock()
 		for i := range mm.Sessions {
@@ -341,8 +337,7 @@ func createSessions() {
 		}
 
 		if !sessionFound {
-			//create new session
-			mm.addSession(Session{
+			mm.Sessions = append(mm.Sessions, Session{
 				ID:      uuid.New(),
 				Mode:    "br",
 				Players: map[string]bool{player: true},
@@ -457,7 +452,7 @@ func listenToBroadCastChannel() {
 
 		//broadcast session status received from pubsub channel to players
 		if payload.From != mm.Id.String() {
-			fmt.Printf("\nreceived from pubsub: %v", payload)
+			//log.Printf("\nreceived from pubsub: %v", payload)
 			for userId := range payload.SessionStatus.Players {
 				mm.mu.RLock()
 				if conn, exists := mm.playerIdToConn[userId]; exists {
@@ -468,6 +463,29 @@ func listenToBroadCastChannel() {
 		}
 	}
 }
+
+/*func assignServersToSessions() {
+	//if session has min players required then assign them game server
+	mm.mu.Lock()
+	defer mm.mu.Unlock()
+	for i := range mm.Sessions {
+		if len(mm.Sessions[i].Players) >= MinPlayers {
+			session := &mm.Sessions[i]
+			// fetch game server from redis & assign it to this session
+			server, err := rdb.LPop(ctx, GameServer).Result()
+			if err != nil {
+				log.Printf("Error fetching game server: %s", err)
+				continue
+			}
+			if server == "" {
+				log.Printf("No game server available for session %s", session.ID.String())
+				continue
+			}
+			session.RoomId = server // This is a placeholder, replace with actual server assignment logic
+			log.Printf("Assigned game server to session %s with players: %v", session.ID, session.Players)
+		}
+	}
+}*/
 
 func mmTick() {
 	// Double-check leadership before processing (extra safety)
@@ -484,7 +502,7 @@ func mmTick() {
 	}
 
 	createSessions()
-
+	//assignServersToSessions()
 	if !mm.isLeader() {
 		log.Println("Lost leadership during tick, aborting remaining operations")
 		return
