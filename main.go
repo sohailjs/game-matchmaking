@@ -36,7 +36,8 @@ const (
 type Matchmaking struct {
 	Id                      uuid.UUID
 	playerIdToConn          map[string]*websocket.Conn
-	Sessions                []Session
+	Sessions                map[string]*Session
+	PlayerIdToSessionId     map[string]string
 	mu                      sync.RWMutex
 	disconnectedPlayersChan chan string
 
@@ -51,12 +52,6 @@ func (mm *Matchmaking) addPlayer(player MMPlayer, conn *websocket.Conn) {
 	mm.mu.Lock()
 	defer mm.mu.Unlock()
 	mm.playerIdToConn[player.UserId] = conn
-}
-
-func (mm *Matchmaking) addSession(session Session) {
-	mm.mu.Lock()
-	defer mm.mu.Unlock()
-	mm.Sessions = append(mm.Sessions, session)
 }
 
 func (mm *Matchmaking) isLeader() bool {
@@ -189,7 +184,8 @@ func init() {
 	mm = &Matchmaking{
 		Id:                      uuid.New(),
 		playerIdToConn:          map[string]*websocket.Conn{},
-		Sessions:                make([]Session, 0),
+		Sessions:                map[string]*Session{},
+		PlayerIdToSessionId:     map[string]string{},
 		disconnectedPlayersChan: make(chan string),
 		redsync:                 rs,
 		isLeaderFlag:            false,
@@ -287,8 +283,8 @@ func main() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			log.Printf("\nNode %s - total connections: %d, isLeader: %t\n",
-				mm.Id.String(), len(mm.playerIdToConn), mm.isLeader())
+			log.Printf("\nNode %s - total connections: %d, total sessions: %d,isLeader: %t\n",
+				mm.Id.String(), len(mm.playerIdToConn), len(mm.Sessions), mm.isLeader())
 
 			if mm.isLeader() {
 				mmTick()
@@ -327,21 +323,24 @@ func createSessions() {
 	for _, player := range playerQueue {
 		sessionFound := false
 		mm.mu.Lock()
-		for i := range mm.Sessions {
-			session := &mm.Sessions[i]
+		for id := range mm.Sessions {
+			session := mm.Sessions[id]
 			if len(session.Players) < MaxPlayers {
 				session.Players[player] = true
 				sessionFound = true
+				mm.PlayerIdToSessionId[player] = id
 				break
 			}
 		}
 
 		if !sessionFound {
-			mm.Sessions = append(mm.Sessions, Session{
-				ID:      uuid.New(),
+			id := uuid.New()
+			mm.Sessions[id.String()] = &Session{
+				ID:      id,
 				Mode:    "br",
 				Players: map[string]bool{player: true},
-			})
+			}
+			mm.PlayerIdToSessionId[player] = id.String()
 		}
 		mm.mu.Unlock()
 	}
@@ -354,66 +353,56 @@ func createSessions() {
 }
 
 func removeDisconnectedPlayersFromSessions() {
-	sessionsIdsToBeDeleted := make([]string, 0)
 	disconnectedPlayers, _ := rdb.LRange(ctx, DisconnectedPlayersList, 0, -1).Result()
+	rdb.Del(ctx, DisconnectedPlayersList)
 
 	mm.mu.Lock()
 	defer mm.mu.Unlock()
 
 	for _, userId := range disconnectedPlayers {
-		for i := range mm.Sessions {
-			session := &mm.Sessions[i]
-			if _, exists := session.Players[userId]; exists {
-				delete(session.Players, userId)
-			}
-			//if 0 players in session then remove session as well
-			if len(session.Players) == 0 {
-				sessionsIdsToBeDeleted = append(sessionsIdsToBeDeleted, session.ID.String())
-			}
+		sessionId, ok := mm.PlayerIdToSessionId[userId]
+		if !ok {
+			log.Printf("User %s not found in any session", userId)
+			continue
 		}
-	}
+		session, exists := mm.Sessions[sessionId]
+		if !exists {
+			log.Printf("Session %s not found ", sessionId)
+			continue
+		}
+		delete(session.Players, userId)
+		delete(mm.PlayerIdToSessionId, userId)
 
-	//clear the disconnected queue once processed
-	rdb.Del(ctx, DisconnectedPlayersList)
-
-	// Remove empty sessions
-	for _, sessionId := range sessionsIdsToBeDeleted {
-		for i := len(mm.Sessions) - 1; i >= 0; i-- {
-			if mm.Sessions[i].ID.String() == sessionId {
-				mm.Sessions = append(mm.Sessions[:i], mm.Sessions[i+1:]...)
-				break
-			}
+		if len(session.Players) == 0 {
+			delete(mm.Sessions, sessionId)
 		}
 	}
 }
 
 func broadcastSessionStatusToPlayers() {
 	mm.mu.RLock()
-	sessions := make([]Session, len(mm.Sessions))
-	copy(sessions, mm.Sessions)
-	mm.mu.RUnlock()
+	defer mm.mu.RUnlock()
 
-	for _, session := range sessions {
+	for _, session := range mm.Sessions {
 		for userId := range session.Players {
-			mm.mu.RLock()
 			if conn, exists := mm.playerIdToConn[userId]; exists {
-				conn.WriteJSON(session)
+				err := conn.WriteJSON(session)
+				if err != nil {
+					log.Printf("error sending session status to user %s: %s", userId, err)
+				}
 			}
-			mm.mu.RUnlock()
 		}
 	}
 }
 
 func broadcastSessionStatusToPubsub() {
 	mm.mu.RLock()
-	sessions := make([]Session, len(mm.Sessions))
-	copy(sessions, mm.Sessions)
-	mm.mu.RUnlock()
+	defer mm.mu.RUnlock()
 
-	for _, session := range sessions {
+	for _, session := range mm.Sessions {
 		payload := BroadCastPayload{
 			From:          mm.Id.String(),
-			SessionStatus: session,
+			SessionStatus: *session,
 		}
 		broadcastPayload, _ := json.Marshal(payload)
 		_, err := rdb.Publish(ctx, SessionStatusPubSub, broadcastPayload).Result()
