@@ -192,10 +192,14 @@ func init() {
 	}
 }
 
-const PlayerQueue = "br:queue"
-const DisconnectedPlayersList = "disconnectedPlayers"
-const SessionStatusPubSub = "sessionStatus"
-const EventQueue = "event"
+const (
+	MinPlayers              = 2
+	MaxPlayers              = 2
+	GameServer              = "GameServer"
+	PlayerQueue             = "br:queue"
+	DisconnectedPlayersList = "disconnectedPlayers"
+	SessionStatusPubSub     = "sessionStatus"
+)
 
 func handleWebSocket(c *gin.Context) {
 	userId := c.Query("userId")
@@ -224,14 +228,15 @@ func handleWebSocket(c *gin.Context) {
 		return
 	}
 
+	conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 	mm.addPlayer(MMPlayer{
 		UserId: userId,
 		Mode:   mode,
 	}, conn)
 
 	defer func() {
-		conn.Close()
 		mm.disconnectedPlayersChan <- userId
+		conn.Close()
 	}()
 
 	_, err = rdb.LPush(ctx, PlayerQueue, userId).Result()
@@ -251,68 +256,6 @@ func handleWebSocket(c *gin.Context) {
 	}
 }
 
-func main() {
-	port := flag.String("port", "8080", "Port to run server on")
-	flag.Parse()
-	addr := fmt.Sprintf(":%s", *port)
-
-	_, err := rdb.Ping(ctx).Result()
-	if err != nil {
-		log.Fatal("can't connect to redis: ", err)
-	}
-
-	r := gin.Default()
-
-	r.GET("/connect", handleWebSocket)
-
-	// Add status endpoint
-	r.GET("/status", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{
-			"nodeId":   mm.Id.String(),
-			"isLeader": mm.isLeader(),
-			"sessions": len(mm.Sessions),
-			"players":  len(mm.playerIdToConn),
-		})
-	})
-
-	// Start leadership management loop
-	go mm.leadershipLoop()
-
-	// Main game loop - only leader processes
-	go func() {
-		ticker := time.NewTicker(1 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			log.Printf("\nNode %s - total connections: %d, total sessions: %d,isLeader: %t\n",
-				mm.Id.String(), len(mm.playerIdToConn), len(mm.Sessions), mm.isLeader())
-
-			if mm.isLeader() {
-				mmTick()
-			}
-		}
-	}()
-
-	go listenToBroadCastChannel()
-	go processDisconnectedPlayers()
-
-	// Graceful shutdown
-	defer func() {
-		mm.releaseLeadership()
-	}()
-
-	log.Printf("Starting matchmaking server on %s", addr)
-	err = r.Run(addr)
-	if err != nil {
-		log.Fatal(err)
-	}
-}
-
-const (
-	MinPlayers = 2
-	MaxPlayers = 2
-	GameServer = "GameServer"
-)
-
 func createSessions() {
 	playerQueue, err := rdb.LRange(ctx, PlayerQueue, 0, -1).Result()
 	if err != nil {
@@ -320,15 +263,17 @@ func createSessions() {
 		return
 	}
 
+	processedPlayers := []string{}
+
 	for _, player := range playerQueue {
 		sessionFound := false
-		mm.mu.Lock()
 		for id := range mm.Sessions {
 			session := mm.Sessions[id]
 			if len(session.Players) < MaxPlayers {
 				session.Players[player] = true
 				sessionFound = true
 				mm.PlayerIdToSessionId[player] = id
+				processedPlayers = append(processedPlayers, player)
 				break
 			}
 		}
@@ -341,24 +286,17 @@ func createSessions() {
 				Players: map[string]bool{player: true},
 			}
 			mm.PlayerIdToSessionId[player] = id.String()
+			processedPlayers = append(processedPlayers, player)
 		}
-		mm.mu.Unlock()
 	}
-
-	//empty the queue
-	_, err = rdb.LTrim(ctx, PlayerQueue, 1, 0).Result()
-	if err != nil {
-		log.Printf("error emptying queue: %s", err)
+	// Only remove the players that were actually processed
+	for _, player := range processedPlayers {
+		rdb.LRem(ctx, PlayerQueue, 1, player)
 	}
 }
 
 func removeDisconnectedPlayersFromSessions() {
 	disconnectedPlayers, _ := rdb.LRange(ctx, DisconnectedPlayersList, 0, -1).Result()
-	rdb.Del(ctx, DisconnectedPlayersList)
-
-	mm.mu.Lock()
-	defer mm.mu.Unlock()
-
 	for _, userId := range disconnectedPlayers {
 		sessionId, ok := mm.PlayerIdToSessionId[userId]
 		if !ok {
@@ -377,28 +315,26 @@ func removeDisconnectedPlayersFromSessions() {
 			delete(mm.Sessions, sessionId)
 		}
 	}
+	// Clear the disconnected players list after processing
+	rdb.Del(ctx, DisconnectedPlayersList)
 }
 
 func broadcastSessionStatusToPlayers() {
-	mm.mu.RLock()
-	defer mm.mu.RUnlock()
-
 	for _, session := range mm.Sessions {
 		for userId := range session.Players {
+			mm.mu.RLock()
 			if conn, exists := mm.playerIdToConn[userId]; exists {
 				err := conn.WriteJSON(session)
 				if err != nil {
 					log.Printf("error sending session status to user %s: %s", userId, err)
 				}
 			}
+			mm.mu.RUnlock()
 		}
 	}
 }
 
 func broadcastSessionStatusToPubsub() {
-	mm.mu.RLock()
-	defer mm.mu.RUnlock()
-
 	for _, session := range mm.Sessions {
 		payload := BroadCastPayload{
 			From:          mm.Id.String(),
@@ -499,4 +435,67 @@ func mmTick() {
 
 	broadcastSessionStatusToPlayers()
 	broadcastSessionStatusToPubsub()
+}
+
+func main() {
+	port := flag.String("port", "8080", "Port to run server on")
+	flag.Parse()
+	addr := fmt.Sprintf(":%s", *port)
+
+	_, err := rdb.Ping(ctx).Result()
+	if err != nil {
+		log.Fatal("can't connect to redis: ", err)
+	}
+
+	r := gin.Default()
+
+	r.GET("/connect", handleWebSocket)
+
+	// Add status endpoint
+	/*r.GET("/status", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"nodeId":   mm.Id.String(),
+			"isLeader": mm.isLeader(),
+			"sessions": len(mm.Sessions),
+			"players":  len(mm.playerIdToConn),
+		})
+	})*/
+
+	// Start leadership management loop
+	go mm.leadershipLoop()
+
+	// Main game loop - only leader processes
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			mm.mu.RLock()
+			log.Printf("\nNode %s - total connections: %d, total sessions: %d,isLeader: %t\n",
+				mm.Id.String(), len(mm.playerIdToConn), len(mm.Sessions), mm.isLeader())
+			mm.mu.RUnlock()
+
+			if mm.isLeader() {
+				t1 := time.Now()
+				mmTick()
+				t2 := time.Now()
+				if t2.Sub(t1).Milliseconds() > 1000 {
+					log.Printf("Node %s took too long to process tick: %d ms", mm.Id.String(), t2.Sub(t1).Milliseconds())
+				}
+			}
+		}
+	}()
+
+	go listenToBroadCastChannel()
+	go processDisconnectedPlayers()
+
+	// Graceful shutdown
+	defer func() {
+		mm.releaseLeadership()
+	}()
+
+	log.Printf("Starting matchmaking server on %s", addr)
+	err = r.Run(addr)
+	if err != nil {
+		log.Fatal(err)
+	}
 }
