@@ -298,6 +298,9 @@ func createSessions() {
 func removeDisconnectedPlayersFromSessions() {
 	disconnectedPlayers, _ := rdb.LRange(ctx, DisconnectedPlayersList, 0, -1).Result()
 	for _, userId := range disconnectedPlayers {
+		//remove from queue if exists TODO: optimize this removing from queue
+		rdb.LRem(ctx, PlayerQueue, 1, userId)
+
 		sessionId, ok := mm.PlayerIdToSessionId[userId]
 		if !ok {
 			log.Printf("User %s not found in any session", userId)
